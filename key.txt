@@ -1,7 +1,1 @@
-{
-"axv": "LHEZL-RPKJG-IPPOR-YWXGV",
-"a": "LISBX-TPVSB-WXKEV-XOMIB",
-"ari": "GSNEP-NTRCE-CTKYK-OIAGD",
-"queentata": "HCYUY-ADXUB-MPCVJ-DGNQE",
-"Nekorai ID": "GSNEP-NTRCE-CTKYK-OIAGD"
-}
+["axv"]

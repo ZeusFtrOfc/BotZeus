@@ -1,1 +1,1 @@
-http://kesbangpol.kalteng.go.id/
+[ "103.73.167.22" ]

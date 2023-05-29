@@ -106,7 +106,7 @@ echo '
         </form>
         <div class="box">
             <div class="header">
-                &copy;&nbsp;Mad Uploader
+                &copy;&nbsp;AXV Uploader
             </div>
             <div class="body">
                 <ul>
@@ -118,7 +118,7 @@ echo '
         </div>
     </div>
     <div class="footer">
-        <span>&copy;Copyright By MrMad</span>
+        <span>&copy;Copyright By AXV Tech!</span>
     </div>
 </body>
 

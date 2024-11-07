@@ -1,4 +1,3 @@
-{
-"BabyClown": "GTSCS-MEXZL-YXMLX-NLUCT",
-"mr localhoazt": "KAEPL-IBDPP-WQYGN-PMUSI"
-}
+[
+  "OWNKEY-O7hYjK93"
+]

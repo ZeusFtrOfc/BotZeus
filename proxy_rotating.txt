@@ -4,6 +4,7 @@
 45.38.111.174:6089:Dmdigital2625:Dmdigital2625
 92.113.231.113:7198:Dmdigital2625:Dmdigital2625
 45.38.111.249:6164:Dmdigital2625:Dmdigital2625
+f.proxys5.net:6280:axvdigital-zone-custom-region-ID-sessid-o6JhMqPO-sessTime-5:axvdigital1711
 92.113.231.116:7201:Dmdigital2625:Dmdigital2625
 45.38.111.83:5998:Dmdigital2625:Dmdigital2625
 92.113.231.82:7167:Dmdigital2625:Dmdigital2625

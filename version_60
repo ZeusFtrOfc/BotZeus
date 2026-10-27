@@ -10535,6 +10535,1568 @@ def build_payload():
     d["watch"] = REG_VIEW["views"]
     return d
 
+# =====================================================================
+# v28: KONSISTEN SETELAH PROFIT BERUNTUN + SNIPER TIDAK BUTA AREA LAWAN
+# =====================================================================
+CONSISTENT_MODE = True          # True = hasil trade TIDAK mengubah P / peringkat / gerbang / tangga SL+
+SNIPER_OPP_ST = 9.0             # zona S/R lawan dengan kekuatan >= ini dianggap penghalang
+SNIPER_OPP_AREA_ST = 40.0       # area lawan yang sedang ditandai dengan kekuatan >= ini = penghalang
+SNIPER_ROOM_ATR = 3.0           # ruang minimal ke penghalang (x ATR M1)
+SNIPER_ROOM_MIN_USD = 4.0       # ...atau minimal sekian dolar (diambil yang lebih besar)
+# gerbang yang tadinya dilewati sniper. Isi () untuk mematikan
+SNIPER_EXTRA_HARD = ("melawan tren M15", "melawan bias", "bukti saling bertentangan", "zona di tengah impuls")
+_ROOM_LOG = {}
+
+# ---------------------------------------------------------------- 1) bekukan pembelajaran dari hasil
+if CONSISTENT_MODE:
+    def _fz_p_win(self, code, side="", regime=None, trig=None, epb=None):
+        return 0.5, 0                       # n=0 -> bobot data hasil = 0, P murni dari struktur
+
+    def _fz_ctx_delta(self, code, side, pdb, stb):
+        return 0.0
+
+    def _fz_lcb_of(self, code, p):
+        return p - self.LCB_Z * math.sqrt(max(p * (1.0 - p), 1e-6) / 2.0)
+
+    def _fz_ev_r(self, p, cost_r=0.0):
+        return p * 0.75 + (1.0 - p) * (-1.0) - cost_r
+
+    Learner.p_win = _fz_p_win
+    Learner.ctx_delta = _fz_ctx_delta
+    Learner.lcb_of = _fz_lcb_of
+    Learner.ev_r = _fz_ev_r
+
+    def _fz_edge_estimate(self, s):
+        return {"exp": 0.0, "lcb": 0.0, "n": float(EDGE_MIN_N) + 1.0, "g": 0.0}
+
+    def _fz_edge_calibrate(self, p):
+        return p
+
+    def _fz_edge_status(self, code, side):
+        return 0.0, 0.0, False
+
+    def _fz_guard_thr(self):
+        return GUARD_CANCEL_RISK
+
+    EdgeBook.estimate = _fz_edge_estimate
+    EdgeBook.calibrate = _fz_edge_calibrate
+    EdgeBook.status = _fz_edge_status
+    EdgeBook.guard_thr = _fz_guard_thr
+    SmartModel.maybe_fit = lambda self, trades: None      # bobot model tetap bobot awal
+    ExitLearner.maybe_update = lambda self: None          # tangga SL+ tidak berganti sendiri
+    print("[MODE-KONSISTEN] aktif: hasil trade tidak lagi mengubah P, peringkat, gerbang edge, model, dan tangga SL+")
+
+
+# ---------------------------------------------------------------- 2) cek area lawan di depan zona
+def opp_barrier(side, lo, hi, a, px):
+    """Return teks alasan jika ada S/R lawan yang kuat terlalu dekat di depan zona, selain itu None.
+    BUY: penghalang = resisten di atas zona. SELL: penghalang = support di bawah zona."""
+    ctx = LAST_CTX
+    if not ctx or not a > 0:
+        return None
+    buy = side == "BUY"
+    ref = max(hi, px) if buy else min(lo, px)
+    gap = 0.05 * a
+    best = None                                   # (ruang, lo, hi, kekuatan)
+    for z in (ctx.get("strong") or []):
+        if float(z["st"]) < SNIPER_OPP_ST:
+            continue
+        if buy and z["lo"] > ref + gap:
+            room = z["lo"] - hi
+        elif (not buy) and z["hi"] < ref - gap:
+            room = lo - z["hi"]
+        else:
+            continue
+        if best is None or room < best[0]:
+            best = (room, z["lo"], z["hi"], float(z["st"]))
+    opp = "SELL" if buy else "BUY"
+    for x in AREA_REG:
+        st = float(x.get("ss") or 0.0)
+        if (not x.get("shown")) or x["side"] != opp or st < SNIPER_OPP_AREA_ST:
+            continue
+        if buy and x["zone_lo"] > ref + gap:
+            room = x["zone_lo"] - hi
+        elif (not buy) and x["zone_hi"] < ref - gap:
+            room = lo - x["zone_hi"]
+        else:
+            continue
+        if best is None or room < best[0]:
+            best = (room, x["zone_lo"], x["zone_hi"], st)
+    if best is None:
+        return None
+    need = max(SNIPER_ROOM_ATR * a, SNIPER_ROOM_MIN_USD)
+    if best[0] >= need:
+        return None
+    return (f"area lawan kuat (st {best[3]:.0f}) di {best[1]:.2f}-{best[2]:.2f} hanya {best[0]:.2f} USD "
+            f"di depan {side}, perlu >= {need:.2f} USD")
+
+
+def _extra_gates(s):
+    if not SNIPER_EXTRA_HARD:
+        return []
+    allg = list(s.get("gates") or []) + list(s.get("gates_soft") or [])
+    return [g for g in allg if g.startswith(SNIPER_EXTRA_HARD)]
+
+
+def _room_log(key, txt):
+    now = time.time()
+    if now - _ROOM_LOG.get(key, 0.0) >= 60:
+        _ROOM_LOG[key] = now
+        log(f"[SNIPER-ROOM] {key}: {txt}")
+
+
+# ---------------------------------------------------------------- 3) sniper memakai gerbang tambahan + cek lawan
+def _sniper_candidate(now, tick):
+    ctx = LAST_CTX
+    if not SNIPER_ON or not ctx or tick is None:
+        return None
+    a = float(ctx["a"])
+    srv = srv_now()
+    best, bs = None, -1e9
+    for x in AREA_REG:
+        s = x.get("setup")
+        if not x.get("shown") or s is None or now - x["last_seen"] > SNIPER_STALE_SEC:
+            continue
+        if x["ps"] < SNIPER_MIN_P or x["ss"] < SNIPER_MIN_STRENGTH:
+            continue
+        if _area_blockers(x, s, a, now, srv):
+            continue
+        ex = _extra_gates(s)
+        if ex:
+            _room_log(x["aid"], "ditahan gerbang: " + ex[0][:90])
+            continue
+        lo, hi, sd = x["zone_lo"], x["zone_hi"], x["side"]
+        if is_parked(sd, lo, hi, now, 0.3 * a):
+            continue
+        buy = sd == "BUY"
+        px = float(tick.ask if buy else tick.bid)
+        dist = (px - hi) if buy else (lo - px)
+        if dist > SNIPER_PLACE_ATR * a or dist < -SNIPER_INSIDE_FRAC * (hi - lo):
+            continue
+        br = opp_barrier(sd, lo, hi, a, px)
+        if br:
+            _room_log(x["aid"], br)
+            continue
+        sc = x["q"] - 2.0 * max(0.0, dist) / a
+        if sc > bs:
+            best, bs = x, sc
+    return best
+
+
+# ---------------------------------------------------------------- 4) fokus sniper gugur jika penghalang muncul
+_match_focus_v28prev = match_focus
+
+
+def match_focus(P, setups, a):
+    m = _match_focus_v28prev(P, setups, a)
+    if m is None or P is None or not P.get("sniper"):
+        return m
+    m = dict(m)
+    extra = _extra_gates(m)
+    try:
+        tk = mt5.symbol_info_tick(SYMBOL)
+        buy = P["side"] == "BUY"
+        px = float(tk.ask if buy else tk.bid) if tk is not None else float(LAST_CTX["m1"].close.iloc[-1])
+        br = opp_barrier(P["side"], float(P["zone_lo"]), float(P["zone_hi"]), float(P["atr"]), px)
+        if br:
+            extra.append(br)
+    except Exception:
+        log_exc("match_focus_v28")
+    if extra:
+        m["gates"] = list(m.get("gates") or []) + extra
+        m["eligible"] = False
+    return m
+
+
+# ---------------------------------------------------------------- 5) pengaman terakhir sebelum limit dipasang
+_place_limit_v28prev = place_limit
+
+
+def place_limit(P, tick, info):
+    try:
+        buy = P["side"] == "BUY"
+        px = float(tick.ask if buy else tick.bid)
+        br = opp_barrier(P["side"], float(P["zone_lo"]), float(P["zone_hi"]), float(P["atr"]), px)
+        if br:
+            return _say("limit tidak dipasang: " + br, "FOKUS")
+    except Exception:
+        log_exc("place_limit_v28")
+    return _place_limit_v28prev(tick=tick, P=P, info=info) if False else _place_limit_v28prev(P, tick, info)
+
+
+# =====================================================================
+# v29: KONSENSUS SADAR LOKASI, POLA ZIGZAG + RE-EVALUASI, AREA BATAS RANGE,
+#      ZONA S/R DENGAN PIVOT H1, RESPONS LEBIH CEPAT
+# TEMPEL SETELAH place_limit v28, SEBELUM  if __name__ == "__main__":
+# =====================================================================
+BOT_VER = "v29"
+
+# ---------------------------------------------------------------- konfigurasi
+# konsensus sadar lokasi
+CONS_RELIEF_ON = True
+CONS_RELIEF_MIN_ST = 50.0       # relief hanya untuk area dengan kekuatan >= ini
+CONS_RELIEF_H1 = 0.25           # H1 searah dengan sisi trade
+CONS_RELIEF_EXTREME = 0.20      # area di ekstrem range 2 hari (>= 75%)
+CONS_RELIEF_REV = 0.20          # ada bukti pembalikan searah di zona
+CONS_RELIEF_RANGE = 0.25        # area tepat di batas range / pola sideways
+CONS_RELIEF_PAT = 0.15          # pola reversal searah (mis. Triple Top untuk SELL) di dekat zona
+CONS_RELIEF_CAP = 0.60          # relief maksimum
+CONS_FOCUS_HYST = 0.15          # fokus yang sudah terkunci diberi kelonggaran sebesar ini
+CONS_HARD_FLOOR = -0.85         # konsensus mentah seburuk ini tetap ditolak walau ada relief
+RANGE_EDGE_P = 0.03             # bonus P untuk area tepat di batas range
+RANGE_EDGE_RANK = 4.0
+
+# pola
+BOUNCE_MIN_STRENGTH = 50.0      # (sebelumnya 60) pantulan di batas pola
+PAT_M1_YIELD_ST = 55.0          # pola M1 belum-breakout tidak mem-veto area berjangkar M5/M15 sekuat ini
+PL_COUNTER_Q_PEN = 8.0          # penalti kualitas area batas range yang melawan bias pola
+ZZ_ON = True                    # pivot ZigZag ATR (lebih dini dan bersih)
+PAT_LINE_MIN_TOUCH_EARLY = 4    # pola 2 atas + 2 bawah boleh muncul dini (dengan penalti kualitas)
+PAT_REEVAL_ON = True
+PAT_REEVAL_HOLD_SEC = 90        # pola terkunci dievaluasi ulang setelah ini
+PAT_REEVAL_MARGIN = 8.0         # pola baru harus lebih baik sekian poin untuk menggantikan
+
+# area & kecepatan
+TF_W[60] = 4.0                  # bobot pivot H1 di zona S/R
+MARK_BIRTH_DWELL_SEC = 3.0      # (sebelumnya 6) area ditandai lebih cepat
+ANALYZE_INTERVAL_SEC = 0.7      # (sebelumnya 1.0)
+BOT_LOOP_SEC = 0.20             # (sebelumnya 0.25)
+
+
+# ---------------------------------------------------------------- 1) util pola
+def _lk_flat(Lk, a_tf):
+    """(garis_atas_datar, garis_bawah_datar). Datar = bergeser <= max(PAT_FLAT_ATR x ATR, 22% tinggi pola)."""
+    u, l = Lk.get("up"), Lk.get("lo")
+    if not u or not l:
+        return False, False
+    h = abs(float(u["p1"]) - float(l["p1"]))
+    thr = max(PAT_FLAT_ATR * a_tf, 0.22 * h)
+    return (abs(float(u["p2"]) - float(u["p1"])) <= thr,
+            abs(float(l["p2"]) - float(l["p1"])) <= thr)
+
+
+def _a_of(ctx, tf):
+    a_tf = next((float(x["a"]) for x in ctx["tfs"] if x["name"] == tf), float(ctx["a"]))
+    return a_tf if a_tf > 0 else float(ctx["a"])
+
+
+def range_edge_at(side, zlo, zhi, ctx):
+    """Teks jika zona tepat di batas range (garis datar / channel / rectangle) pola terkunci yang belum breakout.
+    BUY: batas bawah. SELL: batas atas. Selain itu None."""
+    buy = side == "BUY"
+    mid = (float(zlo) + float(zhi)) / 2.0
+    t_now = int(ctx["T"][-1]) + 60
+    for tf, Lk in list(PAT_LOCK.items()):
+        if Lk.get("dir") != 0 or Lk.get("kind") != "lines" or float(Lk.get("quality", 0)) < PAT_MIN_Q:
+            continue
+        a_tf = _a_of(ctx, tf)
+        u, l = _line_at(Lk["up"], t_now), _line_at(Lk["lo"], t_now)
+        if u <= l:
+            continue
+        fu, fl = _lk_flat(Lk, a_tf)
+        edge, flat = (l, fl) if buy else (u, fu)
+        if (flat or Lk.get("code") in BOUNCE_CODES) and abs(mid - edge) <= BOUNCE_ATR * a_tf:
+            return f"{'batas bawah' if buy else 'batas atas'} {Lk['name']} [{tf}]"
+    return None
+
+
+# ---------------------------------------------------------------- 2) pattern_against baru
+def pattern_against(s, ctx):
+    """v29: tolak entry yang melawan pola terkunci, KECUALI:
+    - pantulan di tepi datar pola (SELL di garis atas datar / BUY di garis bawah datar) atau di channel/rectangle,
+    - penolakan di neckline oleh area kuat,
+    - pola M1 yang belum breakout tidak mem-veto area berjangkar M5/M15 yang kuat.
+    Pola yang sudah breakout tetap mem-veto sisi lawan."""
+    if not PAT_AGAINST_ON:
+        return None
+    side = s["side"]
+    buy = side == "BUY"
+    mid = (float(s["zone_lo"]) + float(s["zone_hi"])) / 2.0
+    t_now = int(ctx["T"][-1]) + 60
+    strength = float(s.get("strength", 0.0))
+    anchored = bool(s.get("anchored"))
+    for tf, Lk in list(PAT_LOCK.items()):
+        if float(Lk.get("quality", 0)) < PAT_AGAINST_MIN_Q:
+            continue
+        bias = Lk.get("bias")
+        if bias not in ("BUY", "SELL") or bias == side:
+            continue
+        a_tf = _a_of(ctx, tf)
+        nm = Lk["name"]
+        if Lk["dir"] != 0:
+            return f"melawan breakout {nm} [{tf}] ke arah {bias}"
+        if tf == "M1" and anchored and strength >= PAT_M1_YIELD_ST:
+            continue
+        if Lk["kind"] == "lines":
+            u, l = _line_at(Lk["up"], t_now), _line_at(Lk["lo"], t_now)
+            fu, fl = _lk_flat(Lk, a_tf)
+            if strength >= BOUNCE_MIN_STRENGTH:
+                edge, flat = (l, fl) if buy else (u, fu)
+                if abs(mid - edge) <= BOUNCE_ATR * a_tf and (Lk.get("code") in BOUNCE_CODES or flat):
+                    continue
+            if buy and mid > l - PAT_ESCAPE_ATR * a_tf:
+                return f"BUY melawan pola {nm} [{tf}] berbias SELL, cari area SELL di garis atas pola"
+            if (not buy) and mid < u + PAT_ESCAPE_ATR * a_tf:
+                return f"SELL melawan pola {nm} [{tf}] berbias BUY, cari area BUY di garis bawah pola"
+        else:
+            ext = Lk.get("ext")
+            if ext is None:
+                continue
+            nk = _line_at(Lk["neck"], t_now)
+            if bias == "BUY" and (not buy) and ext - 0.2 * a_tf <= mid <= nk + 0.5 * a_tf:
+                at_neck = mid >= nk - NECK_REJECT_ATR * a_tf
+                if not (at_neck and strength >= NECK_REJECT_MIN_STRENGTH):
+                    return f"SELL melawan pola {nm} [{tf}] berbias BUY (di tengah pola, bukan di neckline)"
+            if bias == "SELL" and buy and nk - 0.5 * a_tf <= mid <= ext + 0.2 * a_tf:
+                at_neck = mid <= nk + NECK_REJECT_ATR * a_tf
+                if not (at_neck and strength >= NECK_REJECT_MIN_STRENGTH):
+                    return f"BUY melawan pola {nm} [{tf}] berbias SELL (di tengah pola, bukan di neckline)"
+    return None
+
+
+# ---------------------------------------------------------------- 3) konsensus sadar lokasi
+def cons_relief(s, ctx, edge_txt=None):
+    """Relief (0..CONS_RELIEF_CAP) untuk gerbang konsensus. Return (relief, daftar_alasan)."""
+    st = float(s.get("strength", 0.0))
+    if st < CONS_RELIEF_MIN_ST:
+        return 0.0, []
+    side = s["side"]
+    zlo, zhi = float(s["zone_lo"]), float(s["zone_hi"])
+    mid = (zlo + zhi) / 2.0
+    rel, parts = 0.0, []
+    if ctx.get("t60") == side:
+        rel += CONS_RELIEF_H1
+        parts.append("H1 searah")
+    e = float(s.get("pdx", 0.5))
+    if e >= 0.75:
+        rel += CONS_RELIEF_EXTREME
+        parts.append(f"area ekstrem range ({e * 100:.0f}%)")
+    own = float(s.get("rev_own", 0.0))
+    if own >= 0.25:
+        rel += CONS_RELIEF_REV
+        parts.append(f"bukti pembalikan searah {own * 100:.0f}%")
+    if edge_txt:
+        rel += CONS_RELIEF_RANGE
+        parts.append(edge_txt)
+    for tf, Lk in list(PAT_LOCK.items()):
+        if Lk.get("bias") != side or Lk.get("dir") != 0:
+            continue
+        if float(Lk.get("quality", 0)) < PAT_AGAINST_MIN_Q:
+            continue
+        ext = Lk.get("ext")
+        if ext is None:
+            continue
+        a_tf = _a_of(ctx, tf)
+        if abs(mid - float(ext)) <= 0.8 * a_tf + (zhi - zlo):
+            rel += CONS_RELIEF_PAT
+            parts.append(f"{Lk['name']} [{tf}] searah")
+            break
+    return min(rel, CONS_RELIEF_CAP), parts
+
+
+def v29_cons_adjust(setups, ctx):
+    """Dipanggil tepat sebelum registry_update (setelah semua gerbang lama).
+    Mengganti gerbang 'melawan konsensus' dengan versi sadar lokasi, menambah bonus area batas range,
+    dan memberi histeresis untuk fokus yang sudah terkunci."""
+    if not setups:
+        return
+    a = float(ctx["a"])
+    P = PLAN_ACTIVE
+    for s in setups:
+        try:
+            align = float(s.get("align", 0.0))
+            gates = [g for g in s["gates"] if not g.startswith("melawan konsensus")]
+            had = len(gates) != len(s["gates"])
+            edge_txt = range_edge_at(s["side"], float(s["zone_lo"]), float(s["zone_hi"]), ctx)
+            rel, parts = (0.0, [])
+            if CONS_RELIEF_ON and CONS_ON and (align < 0 or had):
+                rel, parts = cons_relief(s, ctx, edge_txt)
+            boost = RANGE_EDGE_P if (edge_txt and float(s.get("strength", 0.0)) >= CONS_RELIEF_MIN_ST) else 0.0
+            if not had and rel <= 0 and boost <= 0:
+                continue
+            adj = align + rel
+            if CONS_ON and (had or rel > 0):
+                is_f = P is not None and is_focus_candidate(P, s, a)
+                thr = CONS_GATE + (CONS_FOCUS_HYST if is_f else 0.0)
+                if align <= CONS_HARD_FLOOR or adj <= -thr:
+                    gates.append(f"melawan konsensus MTF {align:+.2f}"
+                                 + (f" (relief {rel:+.2f} belum cukup)" if rel > 0 else ""))
+            tags = list(s["tags"])
+            if rel > 0:
+                s["align_raw"] = round(align, 2)
+                s["align"] = round(adj, 2)
+                tags.append(f"relief konsensus {rel:+.2f} ({', '.join(parts[:3])})")
+            if boost > 0:
+                tags.append(f"area di {edge_txt} (+{boost * 100:.0f}% P)")
+            dp = CONS_P * rel + boost
+            pw = min(0.92, max(0.15, float(s["pw"]) + dp))
+            s.update(pw=pw, p=round(pw * 100.0, 1), gates=gates, tags=tags,
+                     rank=round(float(s["rank"]) + CONS_RANK * rel + (RANGE_EDGE_RANK if boost > 0 else 0.0), 2),
+                     eligible=not [g for g in gates if ROOM_HARD or not g.startswith("ruang")])
+        except Exception:
+            log_exc("v29_cons_adjust")
+
+
+_registry_update_v29prev = registry_update
+
+
+def registry_update(setups, ctx, now):
+    try:
+        v29_cons_adjust(setups, ctx)
+    except Exception:
+        log_exc("cons_adjust")
+    _registry_update_v29prev(setups, ctx, now)
+
+
+# ---------------------------------------------------------------- 4) area entry dari pola (termasuk batas range)
+PL_COUNTER_ON = True
+
+
+def pattern_entry_zones(side, ctx):
+    """Area entry dari chart pattern terkunci.
+    v29: batas DATAR pola belum-breakout (garis atas datar untuk SELL, garis bawah datar untuk BUY, atau
+    channel/rectangle) tetap menjadi area entry walau bias pola berlawanan (kualitas dikurangi PL_COUNTER_Q_PEN)."""
+    out = []
+    if not PL_ON:
+        return out
+    buy = side == "BUY"
+    t_now = int(ctx["T"][-1]) + 60
+    for tf, Lk in list(PAT_LOCK.items()):
+        q = float(Lk.get("quality", 0))
+        bias = Lk.get("bias")
+        counter = bias in ("BUY", "SELL") and bias != side
+        if counter:
+            if (not PL_COUNTER_ON) or Lk.get("kind") != "lines" or Lk.get("dir") != 0:
+                continue
+            q -= PL_COUNTER_Q_PEN
+        if q < PL_MIN_Q:
+            continue
+        a_tf = _a_of(ctx, tf)
+        zl = zh = None
+        why = ""
+        if Lk["kind"] == "lines":
+            u, l = _line_at(Lk["up"], t_now), _line_at(Lk["lo"], t_now)
+            if u <= l:
+                continue
+            if Lk["dir"] == 0:
+                if counter:
+                    fu, fl = _lk_flat(Lk, a_tf)
+                    if not ((fl if buy else fu) or Lk.get("code") in BOUNCE_CODES):
+                        continue
+                if buy:
+                    zl, zh, why = l - 0.25 * a_tf, l + 0.35 * a_tf, "tolakan garis bawah pola"
+                else:
+                    zl, zh, why = u - 0.35 * a_tf, u + 0.25 * a_tf, "tolakan garis atas pola"
+                if counter:
+                    why += " (batas datar, melawan bias pola)"
+            elif Lk["dir"] == 1 and buy:
+                zl, zh, why = u - 0.35 * a_tf, u + 0.25 * a_tf, "retest garis atas setelah breakout"
+            elif Lk["dir"] == -1 and not buy:
+                zl, zh, why = l - 0.25 * a_tf, l + 0.35 * a_tf, "retest garis bawah setelah breakdown"
+        else:
+            nk = _line_at(Lk["neck"], t_now)
+            if Lk["dir"] == 0:
+                ext = Lk.get("ext")
+                if ext is None:
+                    continue
+                if buy:
+                    zl, zh, why = ext - 0.1 * a_tf, ext + 0.5 * a_tf, "retest dasar pola (prediksi pembalikan naik)"
+                else:
+                    zl, zh, why = ext - 0.5 * a_tf, ext + 0.1 * a_tf, "retest puncak pola (prediksi pembalikan turun)"
+            else:
+                zl, zh, why = nk - 0.3 * a_tf, nk + 0.3 * a_tf, "retest neckline setelah breakout"
+        if zl is None:
+            continue
+        out.append(dict(zl=float(zl), zh=float(zh), tf=tf, q=q, name=Lk["name"], why=why, anch=tf != "M1"))
+    return out
+
+
+# ---------------------------------------------------------------- 5) zona S/R dengan pivot H1
+HTF_CACHE = {"t": 0.0, "df": None}
+
+
+def _h1_df():
+    """H1 di-cache 30 detik (dipakai membentuk zona S/R)."""
+    now = time.time()
+    if now - HTF_CACHE["t"] > 30:
+        HTF_CACHE["t"] = now
+        try:
+            r = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 300)
+            if r is not None and len(r) >= 60:
+                HTF_CACHE["df"] = pd.DataFrame(r).iloc[:-1]
+        except Exception:
+            log_exc("h1_df")
+    return HTF_CACHE["df"]
+
+
+def build_zones(m1, m5, m15, a):
+    """v29: sama dengan v25 (zona sempit tepat di wick pivot), ditambah pivot H1.
+    Level yang berimpit dengan H1 mendapat kekuatan lebih (bonus 4 timeframe +3.5)."""
+    pts = (collect_pivots_k(m1, 1) + collect_pivots_k(m5, 5) + collect_pivots_k(m15, 15)
+           + [(p, w, ag, mm, "D") for p, w, ag, mm in daily_points(m15)])
+    h1 = _h1_df()
+    if h1 is not None:
+        try:
+            pts += collect_pivots_k(h1, 60)
+        except Exception:
+            log_exc("h1_pivots")
+    if not pts or not a > 0:
+        return []
+    a = float(a)
+    pts.sort(key=lambda x: x[0])
+    tol = ZONE_PIV_TOL_A1 * a
+    groups, cur = [], [pts[0]]
+    for q in pts[1:]:
+        if q[0] - cur[-1][0] <= tol and q[0] - cur[0][0] <= 2 * tol:
+            cur.append(q)
+        else:
+            groups.append(cur)
+            cur = [q]
+    groups.append(cur)
+    ref = m5 if m5 is not None else m1
+    H5, L5, C5 = ref.high.values[-300:], ref.low.values[-300:], ref.close.values[-300:]
+    cap, pad, tr = ZONE_CAP_A1 * a, ZONE_PAD_A1 * a, 0.30 * a
+    zones = []
+    for g in groups:
+        gw = sum(max(x[1], 1e-6) for x in g)
+        bands, _ = _tight_bands(g, cap)
+        for bi, band in enumerate(bands):
+            prices = [x[0] for x in band]
+            bw = sum(max(x[1], 1e-6) for x in band)
+            lo, hi = min(prices) - pad, max(prices) + pad
+            if hi - lo < ZONE_MIN_A1 * a:
+                m_ = (lo + hi) / 2.0
+                lo, hi = m_ - ZONE_MIN_A1 * a / 2.0, m_ + ZONE_MIN_A1 * a / 2.0
+            mid = (lo + hi) / 2.0
+            st = bw + (0.4 * (gw - bw) if bi == 0 else 0.0)
+            ntf = len({x[3] for x in band})
+            tfmax = max(x[3] for x in band)
+            if ntf >= 4:
+                st += 3.5
+            elif ntf == 3:
+                st += 2.5
+            elif ntf == 2:
+                st += 1.5
+            if abs(mid - round(mid / 10) * 10) <= tr:
+                st += 2
+            elif abs(mid - round(mid / 5) * 5) <= tr:
+                st += 1
+            if min(x[2] for x in band) <= 120:
+                st += 1
+            touch = (H5 >= lo) & (L5 <= hi)
+            ep = (int(np.sum(touch[1:] & ~touch[:-1])) + int(touch[0])) if len(touch) else 0
+            if ep >= 2:
+                st += min(ZONE_EP_CAP, ZONE_EP_BONUS * ep)
+            sgn = np.where(C5 > hi, 1, np.where(C5 < lo, -1, 0))
+            nz = sgn[sgn != 0]
+            crosses = int(np.sum(nz[1:] * nz[:-1] < 0)) if len(nz) > 1 else 0
+            st -= min(ZONE_CHOP_CAP, ZONE_CHOP_STEP * max(0, crosses - ZONE_CHOP_FREE_M5))
+            zones.append({"lo": float(lo), "hi": float(hi), "mid": float(mid), "st": float(max(st, 0.0)),
+                          "touches": len(band), "tfs": ntf, "ep": int(ep),
+                          "htf": bool(any(x[3] >= 5 for x in band)),
+                          "h1": bool(any(x[3] >= 60 for x in band)),
+                          "tf": "M15" if tfmax >= 15 else "M5" if tfmax >= 5 else "M1",
+                          "nh": int(sum(1 for x in band if x[4] == "H")),
+                          "nl": int(sum(1 for x in band if x[4] == "L"))})
+    return zones
+
+
+# ---------------------------------------------------------------- 6) deteksi pola garis: ZigZag + klasifikasi sideways
+def pivots_zz(H, L, C, a, k=0.9):
+    """Pivot ZigZag berbasis ATR: ayunan terkonfirmasi saat harga berbalik >= k x ATR (tidak perlu menunggu n candle
+    di kanan, jadi lebih dini dan bebas noise kecil). Ditambah SATU pivot sementara di ujung jika harga sudah mulai
+    berbalik >= 0.5k x ATR dari ekstrem terakhir. Return (highs, lows) berisi (indeks, harga)."""
+    n = len(H)
+    ph, pl = [], []
+    if n < 12 or not a > 0:
+        return ph, pl
+    thr = k * a
+    hi, hi_i = float(H[0]), 0
+    lo, lo_i = float(L[0]), 0
+    dirn, ext, ext_i = 0, 0.0, 0
+    for i in range(1, n):
+        h, l = float(H[i]), float(L[i])
+        if dirn == 0:
+            if h > hi:
+                hi, hi_i = h, i
+            if l < lo:
+                lo, lo_i = l, i
+            if hi - lo >= thr:
+                if hi_i > lo_i:
+                    pl.append((lo_i, lo))
+                    dirn, ext, ext_i = 1, hi, hi_i
+                else:
+                    ph.append((hi_i, hi))
+                    dirn, ext, ext_i = -1, lo, lo_i
+        elif dirn == 1:
+            if h > ext:
+                ext, ext_i = h, i
+            elif ext - l >= thr:
+                ph.append((ext_i, ext))
+                dirn, ext, ext_i = -1, l, i
+        else:
+            if l < ext:
+                ext, ext_i = l, i
+            elif h - ext >= thr:
+                pl.append((ext_i, ext))
+                dirn, ext, ext_i = 1, h, i
+    if dirn != 0 and ext_i <= n - 3:
+        c = float(C[-1])
+        if dirn == 1 and ext - c >= 0.5 * thr:
+            ph.append((ext_i, ext))
+        elif dirn == -1 and c - ext >= 0.5 * thr:
+            pl.append((ext_i, ext))
+    return ph, pl
+
+
+def _fit_line(pts, tol, max_m=5):
+    """Pasang garis ke m pivot terakhir (m terbesar dulu sampai 2) yang simpangannya <= tol.
+    Return (slope, intercept, simpangan, pivot_dipakai) atau None."""
+    for m in range(min(max_m, len(pts)), 1, -1):
+        seg = pts[-m:]
+        xs = np.array([p[0] for p in seg], dtype=float)
+        ys = np.array([p[1] for p in seg], dtype=float)
+        if xs[-1] == xs[0]:
+            continue
+        if m == 2:
+            s = (ys[1] - ys[0]) / (xs[1] - xs[0])
+            b = ys[0] - s * xs[0]
+            dev = 0.0
+        else:
+            s, b = np.polyfit(xs, ys, 1)
+            dev = float(np.max(np.abs(ys - (s * xs + b))))
+        if dev <= tol:
+            return float(s), float(b), dev, seg
+    return None
+
+
+def _line_from_pivots(ph, pl, C, T, a):
+    """Satu kandidat pola garis dari satu set pivot. None jika tidak ada pola yang valid."""
+    n = len(C)
+    lo_i = n - PAT_LINE_MAX_BARS
+    phw = [p for p in ph if p[0] >= lo_i]
+    plw = [p for p in pl if p[0] >= lo_i]
+    if len(phw) < 2 or len(plw) < 2:
+        return None
+    tol = PAT_LINE_DEV_ATR * a
+    fu, fl = _fit_line(phw, tol), _fit_line(plw, tol)
+    if fu is None or fl is None:
+        return None
+    su, bu, du, hs = fu
+    sl_, bl, dl, ls = fl
+    touches = len(hs) + len(ls)
+    if touches < PAT_LINE_MIN_TOUCH_EARLY:
+        return None
+    early = touches < PAT_LINE_MIN_TOUCH
+    i0 = min(hs[0][0], ls[0][0])
+    i_last = max(hs[-1][0], ls[-1][0])
+    span = i_last - i0
+    if span < PAT_LINE_MIN_BARS or n - 1 - i_last > PAT_LINE_MAX_IDLE:
+        return None
+    up = lambda i: su * i + bu
+    lw = lambda i: sl_ * i + bl
+    w0, w_last = up(i0) - lw(i0), up(i_last) - lw(i_last)
+    if w0 < 1.0 * a or w_last < 0.1 * a:
+        return None
+    xs = np.arange(i0, i_last + 1)
+    inside = (C[xs] <= up(xs) + 0.3 * a) & (C[xs] >= lw(xs) - 0.3 * a)
+    contain = float(inside.mean())
+    if contain < PAT_CONTAIN_MIN + (0.07 if early else 0.0):
+        return None
+
+    ru, rl = su * span / a, sl_ * span / a              # pergeseran garis sepanjang pola (x ATR)
+    thr = max(PAT_FLAT_ATR, 0.22 * w0 / a)              # "datar" relatif terhadap tinggi pola (sideways = rectangle)
+    flat_u, flat_l = abs(ru) <= thr, abs(rl) <= thr
+    conv = w_last <= 0.75 * w0
+    parallel = abs(su - sl_) * span <= 0.6 * a and w_last >= 0.8 * w0
+    code = None
+    if flat_u and flat_l and w_last >= 0.8 * w0:
+        code = "RECT"
+    elif conv:
+        if flat_u and rl > thr:
+            code = "TRI_A"
+        elif flat_l and ru < -thr:
+            code = "TRI_D"
+        elif ru < -thr and rl > thr:
+            code = "TRI_S"
+        elif ru > thr and rl > thr:
+            code = "WDG_R"
+        elif ru < -thr and rl < -thr:
+            code = "WDG_F"
+    elif parallel and ru > thr and rl > thr:
+        code = "CH_U"
+    elif parallel and ru < -thr and rl < -thr:
+        code = "CH_D"
+    if code is None:
+        return None
+
+    tb = 0.1 * a
+    dirn, jb = 0, None
+    for j in range(i_last + 1, n):
+        if C[j] > up(j) + tb:
+            dirn, jb = 1, j
+            break
+        if C[j] < lw(j) - tb:
+            dirn, jb = -1, j
+            break
+    c = float(C[-1])
+    if jb is None:
+        status, bias = "terbentuk", LINE_PAT[code][1]
+    else:
+        if n - 1 - jb > 40:
+            return None
+        rest = np.arange(jb + 1, n)
+        if len(rest):
+            if dirn == 1 and (C[rest] < up(rest) - 0.5 * a).any():
+                return None
+            if dirn == -1 and (C[rest] > lw(rest) + 0.5 * a).any():
+                return None
+        beyond = (c - up(n - 1)) if dirn == 1 else (lw(n - 1) - c)
+        status = "retest" if beyond <= 0.35 * a else "breakout"
+        bias = "BUY" if dirn == 1 else "SELL"
+
+    fit_pts = (1 if len(hs) >= 3 else 0) + (1 if len(ls) >= 3 else 0)
+    q = min(45.0, 10.0 * touches - 10.0)
+    q += 20.0 * max(0.0, 1.0 - max(du, dl) / tol) * (0.5 + 0.25 * fit_pts)
+    q += 15.0 * max(0.0, min(1.0, (contain - PAT_CONTAIN_MIN) / (1.0 - PAT_CONTAIN_MIN)))
+    q += 10.0 * min(1.0, w0 / (2.0 * a))
+    q += {"terbentuk": 5.0, "breakout": 10.0, "retest": 10.0}[status]
+    if early:
+        q -= 10.0
+
+    now_up, now_lo = float(up(n - 1)), float(lw(n - 1))
+    z_lo, z_hi = min(now_lo, now_up), max(now_lo, now_up)
+    dist = 0.0 if z_lo <= c <= z_hi else min(abs(c - z_lo), abs(c - z_hi)) / a
+    t1, t2 = int(T[i0]), int(T[n - 1])
+    geom = [{"k": "line", "t1": t1, "p1": round(float(up(i0)), 2), "t2": t2, "p2": round(now_up, 2), "label": "Pola"},
+            {"k": "line", "t1": t1, "p1": round(float(lw(i0)), 2), "t2": t2, "p2": round(now_lo, 2), "label": "Pola"}]
+    return dict(code=code, name=LINE_PAT[code][0], bias=bias, status=status, quality=round(q, 1),
+                geom=geom, zone_lo=round(z_lo, 2), zone_hi=round(z_hi, 2), start=t1,
+                dist_atr=round(dist, 2))
+
+
+def detect_line_patterns(H, L, C, T, a):
+    """v29: segitiga, wedge, channel, rectangle (satu kandidat terbaik dari pivot ZigZag atau klasik),
+    ditambah Bull/Bear Flag dan detektor rectangle berbasis cluster. Real price (tidak dicerminkan)."""
+    out = []
+    n = len(C)
+    if n < 60 or not a > 0:
+        return out
+    sets = [pivots(H, L, PIV)]
+    if ZZ_ON:
+        sets.insert(0, pivots_zz(H, L, C, a, 0.8 if PIV <= 2 else 0.95))
+    cands = []
+    for ph, pl in sets:
+        try:
+            r = _line_from_pivots(ph, pl, C, T, a)
+        except Exception:
+            log_exc("line_from_pivots")
+            r = None
+        if r:
+            cands.append(r)
+    if cands:
+        out.append(max(cands, key=lambda x: x["quality"]))
+    for fn in (detect_flags, detect_rectangle):
+        if fn is detect_rectangle and any(o["code"] == "RECT" for o in out):
+            continue
+        try:
+            out += fn(H, L, C, T, a)
+        except Exception:
+            log_exc(fn.__name__)
+    return out
+
+
+# ---------------------------------------------------------------- 7) re-evaluasi pola terkunci
+def pat_reeval(ctx):
+    """Pola terkunci yang BELUM breakout dilepas jika ada pola lain yang jelas lebih baik
+    (mis. Ascending Triangle -> Rectangle saat harga ternyata sideways). Lepas tanpa memasukkan ke PAT_DEAD."""
+    now = time.time()
+    for tf in ctx["tfs"]:
+        nm = tf["name"]
+        Lk = PAT_LOCK.get(nm)
+        if Lk is None or Lk.get("dir") != 0 or now - float(Lk.get("locked", now)) < PAT_REEVAL_HOLD_SEC:
+            continue
+        sc = _pat_candidates(tf)
+        if not sc:
+            continue
+        best = sc[0]
+        if best["code"] == Lk["code"]:
+            continue
+        cur_sel = float(Lk.get("quality", 0.0)) - PAT_DIST_W * float(Lk.get("dist_atr", 0.0))
+        if best["sel"] >= cur_sel + PAT_REEVAL_MARGIN:
+            log(f"[POLA] {Lk['name']} [{nm}] diganti {best['name']}: skor {cur_sel:.0f} -> {best['sel']:.0f}")
+            PAT_LOCK.pop(nm, None)
+
+
+_ucp_v29prev = update_chart_patterns
+
+
+def update_chart_patterns(ctx, new_bar=True):
+    if PATTERN_DRAW_ON and PAT_REEVAL_ON and PATTERNS["bar"] != int(ctx["T"][-1]):
+        try:
+            pat_reeval(ctx)
+        except Exception:
+            log_exc("pat_reeval")
+    _ucp_v29prev(ctx, new_bar)
+    
+# =====================================================================
+# v30: ZONE CONVICTION + COMMITMENT (area terkunci, tanpa gonta-ganti)
+# TEMPEL SETELAH update_chart_patterns v29, SEBELUM  if __name__ == "__main__":
+# =====================================================================
+BOT_VER = "v30"
+
+# ---------------------------------------------------------------- konfigurasi
+COMMIT_TIER_A = 68.0             # keyakinan >= ini = tier A (sangat yakin)
+COMMIT_MIN_CV = 56.0             # keyakinan minimal untuk dikomit jadi fokus + dipasangi limit (tier B)
+COMMIT_KEEP_CV = 44.0            # tanda di chart bertahan selama keyakinan >= ini
+MARK_BIRTH_CV = 50.0             # kandidat baru ditandai jika keyakinan >= ini
+COMMIT_MIN_ST = 34.0             # kekuatan area minimal untuk dikomit
+COMMIT_DWELL_SEC = 3.0           # keyakinan harus >= COMMIT_MIN_CV terus-menerus selama ini
+COMMIT_WINDOW_ATR = 14.0         # area dikomit saat harga dalam jarak ini (x ATR M1)
+COMMIT_DIST_W = 1.2              # penalti pemilihan per 1 ATR jarak
+COMMIT_P_FLOOR = 60.0            # P fokus terkomit tidak turun di bawah ini (agar limit tidak ditolak gerbang P)
+COMMIT_CV_SLACK = 12.0           # keyakinan area terkomit tidak turun lebih dari ini dari saat dikomit
+COMMIT_CV_RISE_TAU = 20.0        # detik, penghalusan saat keyakinan naik
+COMMIT_CV_FALL_TAU = 150.0       # detik, penghalusan saat keyakinan turun (lambat)
+COMMIT_MAX_MIN = 120             # komitmen kedaluwarsa jika area tidak tersentuh selama ini (menit)
+# pelepasan komitmen (hanya bukti nyata)
+COMMIT_BREAK_ATR = 0.5           # close M1 melewati sisi jauh zona sejauh ini dihitung "di luar"
+COMMIT_BREAK_CLOSES = 2          # sekian close M1 berturut-turut di luar = tembus
+COMMIT_BREAK_DEEP_ATR = 1.4      # satu close M1 sedalam ini = langsung tembus
+COMMIT_LIVE_BREAK_ATR = 1.4      # harga live di luar sedalam ini...
+COMMIT_LIVE_BREAK_SEC = 20       # ...selama sekian detik = tembus
+COMMIT_AWAY_ATR = 3.0            # setelah disentuh lalu harga lari sejauh ini = area dilepas (diparkir)
+COMMIT_FAR_RELEASE_ATR = 22.0    # belum disentuh tetapi harga lari sejauh ini = dilepas
+# penggantian area
+COMMIT_SWITCH_HOLD_SEC = 180
+COMMIT_SWITCH_COOLDOWN_SEC = 240
+COMMIT_SWITCH_MARGIN = 14.0      # kandidat lebih dekat ke harga harus lebih yakin sekian poin
+COMMIT_SWITCH_FAR_MARGIN = 22.0  # kandidat yang lebih jauh harus lebih yakin sekian poin
+COMMIT_NEAR_ATR = 2.5            # harga lebih dekat dari ini ke fokus = tidak boleh ganti
+# gerbang
+COMMIT_HARD_GATES = ("memori kesalahan", "SL struktur")      # satu-satunya gerbang yang menggugurkan fokus terkomit
+SEL_BLOCK_GATES = ("melawan breakout", "BUY melawan pola", "SELL melawan pola", "riwayat pantulan",
+                   "riwayat reaksi", "baru kalah", "edge negatif")   # gerbang saat MEMILIH (bukan saat bertahan)
+
+# konstanta lama yang menjadi penyebab, disesuaikan
+GUARD_ON = False                 # penjaga limit (prediksi tembus) dimatikan: pendekatan harga bukan bukti tembus
+IMPULSE_ATR = 0.0                # 0 = harga melaju ke area tidak lagi menghalangi pemasangan limit
+LIMIT_PLACE_ATR = 8.0            # limit dipasang lebih awal supaya sudah menunggu saat harga tiba
+FOCUS_STALE_MIN = 180            # fokus tidak basi lebih cepat dari komitmen (COMMIT_MAX_MIN)
+
+COMMIT_DIAG = {"t": 0.0}
+
+
+def tier_of(cv):
+    return "A" if cv >= COMMIT_TIER_A else "B" if cv >= COMMIT_MIN_CV else "C" if cv >= COMMIT_KEEP_CV else "D"
+
+
+def commit_release(aid):
+    x = _area_by_id(aid)
+    if x is not None:
+        x["commit"] = False
+
+
+# ---------------------------------------------------------------- 1) dossier zona + keyakinan
+def _bounce_stats(df, a_tf, zlo, zhi, buy, win=12, target=0.9):
+    """Riwayat reaksi harga di zona yang PERSIS sama. Tiap kali harga masuk zona dari sisi datang:
+    bertahan = pantul >= target ATR sebelum close menembus; gagal = close menembus lebih dulu.
+    Return (bertahan, gagal, rata2 pantulan USD, pantulan terbesar USD)."""
+    H, L, O, C = mirror_df(df, buy)
+    zl, zh = (zlo, zhi) if buy else (-zhi, -zlo)
+    n = len(C)
+    if n < 60 or not a_tf > 0:
+        return 0, 0, 0.0, 0.0
+    touch = (L <= zh) & (H >= zl)
+    holds = fails = 0
+    mfes = []
+    i = 1
+    while i < n - 1:
+        if touch[i] and (not touch[i - 1]) and C[i - 1] > zh:
+            low_run, best, held, failed = float(L[i]), 0.0, False, False
+            for j in range(i, min(i + win, n - 1) + 1):
+                low_run = min(low_run, float(L[j]))
+                if (not held) and C[j] < zl - 0.3 * a_tf:
+                    failed = True
+                    break
+                best = max(best, float(H[j]) - low_run)
+                if j > i and best >= target * a_tf:
+                    held = True
+            if held:
+                holds += 1
+                mfes.append(best)
+            elif failed:
+                fails += 1
+            i += max(win // 2, 3)
+        else:
+            i += 1
+    return holds, fails, (float(np.mean(mfes)) if mfes else 0.0), (float(max(mfes)) if mfes else 0.0)
+
+
+_DOSS_CACHE = {"bar": 0, "d": {}}
+
+
+def zone_dossier(side, zlo, zhi, ctx):
+    bar = int(ctx["T"][-1])
+    if _DOSS_CACHE["bar"] != bar:
+        _DOSS_CACHE.update(bar=bar, d={})
+    key = (side, round(float(zlo), 2), round(float(zhi), 2))
+    hit = _DOSS_CACHE["d"].get(key)
+    if hit is not None:
+        return hit
+    buy = side == "BUY"
+    t5, t15 = _tfdf(ctx, "M5"), _tfdf(ctx, "M15")
+    a1 = float(ctx["a"])
+    a5 = float(t5["a"]) if t5 else 1.5 * a1
+    a5 = a5 if a5 > 0 else 1.5 * a1
+    a15 = float(t15["a"]) if t15 else 2.0 * a1
+    h = f = mfe_sum = mfe_w = mx = 0.0
+    for df, a_tf, wt in ((ctx["m1"], a1, 0.6),
+                         (t5["df"] if t5 else None, a5, 1.0),
+                         (t15["df"] if t15 else None, a15, 1.5)):
+        if df is None or not a_tf > 0:
+            continue
+        ho, fa, avg_usd, mx_usd = _bounce_stats(df, a_tf, zlo, zhi, buy)
+        h += wt * ho
+        f += wt * fa
+        if ho:
+            mfe_sum += wt * ho * avg_usd
+            mfe_w += wt * ho
+        mx = max(mx, mx_usd)
+    n = h + f
+    d = dict(hold=h, fail=f, n=n, hr=(h + 1.0) / (n + 2.0),
+             avg=(mfe_sum / mfe_w / a5) if mfe_w > 0 else 0.0, mx=mx / a5)
+    _DOSS_CACHE["d"][key] = d
+    return d
+
+
+def area_conviction(x, ctx, s=None):
+    """Keyakinan 0-100 bahwa zona ini akan MEMBALIKKAN harga. Hanya bukti struktural (tanpa momentum M1/M5)."""
+    side = x["side"]
+    sg = 1 if side == "BUY" else -1
+    a = float(ctx["a"])
+    zlo, zhi = float(x["zone_lo"]), float(x["zone_hi"])
+    d = zone_dossier(side, zlo, zhi, ctx)
+    parts, notes = {}, []
+    parts["struktur"] = 22.0 * _c((float(x.get("ss", 0.0)) - 20.0) / 65.0, 0.0, 1.0)
+    if d["n"] >= 1.0:
+        react = 0.6 * d["hr"] + 0.4 * _c(d["avg"] / 3.0, 0.0, 1.0)
+        notes.append(f"pantulan: {d['hr'] * 100:.0f}% bertahan dari {d['n']:.0f} sentuhan (rata2 {d['avg']:.1f} ATR M5)")
+    else:
+        react = 0.50 if x.get("code") in ("SD", "OB") else 0.42
+        notes.append("zona segar / belum pernah diuji")
+    parts["reaksi"] = 24.0 * react
+    parts["asal"] = 12.0 * _c(d["mx"] / 4.0, 0.0, 1.0)
+    if d["mx"] >= 2.0:
+        notes.append(f"pernah memantulkan harga {d['mx']:.1f} ATR M5")
+    v = sg * (1.0 * _sg(ctx["t60"]) + 1.5 * _sg(ctx["htf"]) + 1.0 * _sg(ctx["st15"]["s"]))
+    parts["htf"] = 14.0 * _c((v + 3.5) / 7.0, 0.0, 1.0)
+    cf = 0.22 * len(x.get("confl") or [])
+    if s:
+        cf += 0.25 * len(s.get("combo") or [])
+    z = _zone_for(x, ctx, a)
+    if z:
+        cf += 0.30 * (1 if z.get("h1") else 0) + 0.12 * max(0, int(z.get("tfs", 1)) - 1)
+        if z.get("h1"):
+            notes.append("berimpit pivot H1")
+    parts["konfluens"] = 12.0 * min(1.0, cf)
+    pdx = float(s.get("pdx", 0.5)) if s else 0.5
+    fx = (s.get("fx") or {}) if s else {}
+    loc = (0.45 * pdx + 0.30 * _c(float(fx.get("liq", 0.0)), 0.0, 1.0)
+           + 0.25 * _c((float(fx.get("value", 0.0)) + 1.0) / 2.0, 0.0, 1.0))
+    parts["lokasi"] = 10.0 * loc
+    parts["ruang"] = 6.0 * (1.0 if (s is None or s.get("room_ok", True)) else 0.3)
+    cv = _c(sum(parts.values()), 0.0, 100.0)
+    return float(cv), parts, notes
+
+
+_registry_update_v30prev = registry_update
+
+
+def registry_update(setups, ctx, now):
+    """Setelah registry biasa: hitung keyakinan tiap area (naik cepat, turun lambat). Area terkomit tidak boleh
+    turun lebih dari COMMIT_CV_SLACK dari saat dikomit."""
+    _registry_update_v30prev(setups, ctx, now)
+    for x in AREA_REG:
+        try:
+            _norm_area(x)
+            x.setdefault("commit", False)
+            raw, parts, notes = area_conviction(x, ctx, x.get("setup"))
+            prev = x.get("cv")
+            dt = max(0.0, now - float(x.get("cv_t") or now))
+            if prev is None:
+                cv = raw
+            else:
+                tau = COMMIT_CV_RISE_TAU if raw > prev else COMMIT_CV_FALL_TAU
+                cv = prev + (1.0 - math.exp(-dt / tau)) * (raw - prev)
+            if x.get("commit"):
+                cv = max(cv, float(x.get("commit_cv", cv)) - COMMIT_CV_SLACK)
+            x.update(cv=float(cv), cv_raw=float(raw), cv_t=now, cv_parts=parts, cv_notes=notes, tier=tier_of(cv))
+            if cv >= COMMIT_MIN_CV:
+                x["cv_ok_since"] = x.get("cv_ok_since") or now
+            else:
+                x["cv_ok_since"] = 0.0
+        except Exception:
+            log_exc("area_conviction")
+
+
+_conviction_v30prev = conviction      # <- harus SEBELUM def baru; ini versi v20
+
+
+def conviction(s):
+    """Dipakai level limit: makin yakin makin dangkal (lebih mudah terisi)."""
+    if s.get("cv") is not None:
+        return float(_c((float(s["cv"]) - 44.0) / 36.0, 0.0, 1.0))
+    return _conviction_v30prev(s)
+
+
+# ---------------------------------------------------------------- 2) blokir struktural saja
+def _area_blockers(x, s, a, now, srv, retire=False):
+    """Alasan area ini tidak punya rencana entry. v30: momentum, konsensus, pola pembalikan jangka pendek
+    TIDAK dihitung. Saat memilih: hanya gerbang struktural. Saat mempertahankan tanda (retire=True): hanya
+    blokir nyata (tembus, stop-out)."""
+    if s is None:
+        return ["belum ada data setup"]
+    out = []
+    if not retire:
+        allg = list(s.get("gates") or []) + list(s.get("gates_soft") or [])
+        out += [g for g in allg if g.startswith(SEL_BLOCK_GATES)][:2]
+    sd, lo, hi = x["side"], x["zone_lo"], x["zone_hi"]
+    if _block_left(sd, lo, hi, a, now) > (SHORT_BLOCK_SEC if retire else 0.0):
+        out.append("area baru saja gagal atau ditutup")
+    if is_broken_area(sd, lo, hi, now):
+        out.append("area tembus")
+    if mm_blocked(sd, lo, hi, srv):
+        out.append("memori kesalahan (stop-out)")
+    return out
+
+
+# ---------------------------------------------------------------- 3) deteksi tembus sadar tier
+def _area_check(x, ctx):
+    """Tembus hanya lewat CLOSE. Tier A/B atau terkomit butuh bukti lebih kuat: beberapa close M1 berturut-turut,
+    dan margin close TF area yang lebih lebar. Juga menghitung sentuhan."""
+    buy = x["side"] == "BUY"
+    lo, hi = x["zone_lo"], x["zone_hi"]
+    a1 = float(ctx["a"])
+    m1 = ctx["m1"]
+    T1, C1, H1, L1 = m1.time.values, m1.close.values, m1.high.values, m1.low.values
+    tf = _tfdf(ctx, x["tf"]) or _tfdf(ctx, "M5")
+    df = tf["df"]
+    T, C = df.time.values, df.close.values
+    if not x.get("chk1") or not x.get("chk_t"):
+        x["chk1"], x["chk_t"] = int(T1[-1]), int(T[-1])
+        return None
+    tier = x.get("tier", "C")
+    need = 3 if tier == "A" else 2 if (tier == "B" or x.get("commit")) else 1
+    mult = 1.4 if tier == "A" else 1.2 if tier == "B" else 1.0
+    reason = None
+    for j in np.where(T1 > x["chk1"])[0]:
+        c = float(C1[j])
+        touch = bool(L1[j] <= hi and H1[j] >= lo)
+        if touch and not x.get("in_touch"):
+            x["touches"] = int(x.get("touches", 0)) + 1
+        x["in_touch"] = touch
+        beyond = (lo - c) if buy else (c - hi)
+        if beyond >= AREA_FAST_BREAK_ATR * a1:
+            x["out_n"] = int(x.get("out_n", 0)) + 1
+            if x["out_n"] >= need:
+                reason = f"{x['out_n']} close M1 berturut-turut menembus dalam"
+        else:
+            x["out_n"] = 0
+    x["chk1"] = int(T1[-1])
+    atf = float(tf["a"]) if float(tf["a"]) > 0 else a1
+    brk = AREA_BREAK_ATR.get(x["tf"], 0.35) * atf * mult
+    for j in np.where(T > x["chk_t"])[0]:
+        c = float(C[j])
+        if (buy and c < lo - brk) or ((not buy) and c > hi + brk):
+            reason = reason or f"close {x['tf']} menembus sisi jauh"
+    x["chk_t"] = int(T[-1])
+    return reason
+
+
+# ---------------------------------------------------------------- 4) registry: tanda bertahan karena keyakinan
+def commit_diag(now):
+    if now - COMMIT_DIAG["t"] < 30:
+        return
+    COMMIT_DIAG["t"] = now
+    rows = sorted([x for x in AREA_REG if x.get("shown")], key=lambda q: -float(q.get("cv", 0.0)))[:4]
+    if rows:
+        log("[KEYAKINAN] " + " | ".join(
+            f"{x['side']} {x['code']}[{x['tf']}] {x['zone_lo']}-{x['zone_hi']} cv {x.get('cv', 0):.0f}"
+            f"{x.get('tier', '-')}{'*' if x.get('commit') else ''} jarak {x['dist_atr']:.1f}" for x in rows))
+
+
+def registry_maintain(ctx, now, new_bar):
+    """KANDIDAT -> DITANDAI -> DICABUT, berbasis keyakinan struktural (bukan P yang bergoyang).
+    Area ditandai jika keyakinan >= MARK_BIRTH_CV. Area tampil dicabut hanya jika: tembus (close),
+    keyakinan < COMMIT_KEEP_CV terus-menerus MARK_DROP_SEC, terpakai, atau blokir nyata. Area terkomit kebal
+    terhadap alasan lemah (jauh, tidak terdeteksi sesaat)."""
+    a = float(ctx["a"])
+    px = float(ctx["m1"].close.iloc[-1])
+    srv = srv_now()
+    RETIRED[:] = [r for r in RETIRED if r["until"] > now]
+    for x in AREA_REG:
+        _norm_area(x)
+        if x.get("commit") and (PLAN_ACTIVE is None or PLAN_ACTIVE.get("aid") != x["aid"]):
+            x["commit"] = False                       # komitmen mengikuti fokus aktif
+
+    if new_bar:
+        for x in list(AREA_REG):
+            try:
+                why = _area_check(x, ctx)
+            except Exception:
+                log_exc("area_check")
+                why = None
+            if why:
+                _retire(x, f"TEMBUS ({why})", now, broken=True)
+
+    why_not = {}
+    for x in list(AREA_REG):
+        buy = x["side"] == "BUY"
+        x["dist_atr"] = max(0.0, (px - x["zone_hi"]) if buy else (x["zone_lo"] - px)) / a
+        x["q"] = area_rank(x) + 0.3 * float(x.get("cv", 0.0))
+        s = x.get("setup")
+        unseen = now - x["last_seen"]
+        committed = bool(x.get("commit"))
+        cv = float(x.get("cv", 0.0))
+        x["blockers"] = _area_blockers(x, s, a, now, srv)
+        if x.get("shown"):
+            if (not committed and int(x.get("touches") or 0) >= 2 and x["code"] in SINGLE_USE
+                    and unseen > AREA_CONSUMED_SEC):
+                _retire(x, "sudah terpakai (disentuh 2x lalu hilang dari pemindaian)", now)
+                continue
+            weak = []
+            if not committed:
+                if cv < COMMIT_KEEP_CV:
+                    weak.append(f"keyakinan {cv:.0f} < {COMMIT_KEEP_CV:.0f}")
+                if x["dist_atr"] > MARK_KEEP_MAX_ATR:
+                    weak.append(f"terlalu jauh ({x['dist_atr']:.0f} ATR)")
+                if unseen > MARK_UNSEEN_SEC.get(x["tf"], 1800):
+                    weak.append(f"tidak terdeteksi lagi {unseen / 60:.0f} menit")
+            weak += _area_blockers(x, s, a, now, srv, retire=True)[:2]
+            if weak:
+                if not x["weak_since"]:
+                    x["weak_since"] = now
+                elif now - x["weak_since"] >= MARK_DROP_SEC:
+                    _retire(x, f"lemah terus-menerus {MARK_DROP_SEC:.0f} detik: " + "; ".join(weak[:3]), now)
+                    continue
+            else:
+                x["weak_since"] = 0.0
+        else:
+            if unseen > 180 or now - x["born"] > 900:
+                AREA_REG.remove(x)
+                continue
+            reason = None
+            if s is None:
+                reason = "belum ada data"
+            elif x["blockers"]:
+                reason = "gerbang: " + x["blockers"][0][:40]
+            elif cv < MARK_BIRTH_CV:
+                reason = f"keyakinan {cv:.0f} < {MARK_BIRTH_CV:.0f}"
+            elif x["ss"] < MARK_BIRTH_ST:
+                reason = "kekuatan rendah"
+            elif x["dist_atr"] > MARK_BIRTH_MAX_ATR:
+                reason = "terlalu jauh"
+            elif unseen > 5.0:
+                reason = "tidak terdeteksi"
+            if reason is None:
+                if not x["qual_since"]:
+                    x["qual_since"] = now
+            else:
+                x["qual_since"] = 0.0
+                why_not[reason] = why_not.get(reason, 0) + 1
+    AREA_DIAG["why_not"] = why_not
+
+    shown = [x for x in AREA_REG if x.get("shown")]
+    cnt_side, cnt_tf = {}, {}
+    for k in shown:
+        cnt_side[k["side"]] = cnt_side.get(k["side"], 0) + 1
+        cnt_tf[(k["tf"], k["side"])] = cnt_tf.get((k["tf"], k["side"]), 0) + 1
+    ready = sorted([x for x in AREA_REG if not x.get("shown") and x["qual_since"]
+                    and now - x["qual_since"] >= MARK_BIRTH_DWELL_SEC], key=lambda q: -q["q"])
+    gap = MARK_CLUSTER_ATR * a
+    for x in ready:
+        cl = next((k for k in shown if k["side"] == x["side"] and _gap(k, x) <= gap), None)
+        if cl is not None:
+            if x["code"] != cl["code"] and x["code"] not in cl["confl"]:
+                cl["confl"].append(x["code"])
+            AREA_REG.remove(x)
+            continue
+        if (cnt_side.get(x["side"], 0) >= MARK_MAX_PER_SIDE
+                or cnt_tf.get((x["tf"], x["side"]), 0) >= AREA_MAX_PER_TF_SIDE):
+            continue
+        x["shown"], x["hidden"], x["weak_since"] = True, False, 0.0
+        shown.append(x)
+        cnt_side[x["side"]] = cnt_side.get(x["side"], 0) + 1
+        cnt_tf[(x["tf"], x["side"])] = cnt_tf.get((x["tf"], x["side"]), 0) + 1
+        log(f"[AREA] DITANDAI {x['side']} {x['name']} [{x['tf']}] {x['zone_lo']}-{x['zone_hi']} "
+            f"(lebar {x['zone_hi'] - x['zone_lo']:.2f}) keyakinan {x.get('cv', 0):.0f} tier {x.get('tier', '-')} "
+            f"P {x['ps']:.0f}% kuat {x['ss']:.0f} jarak {x['dist_atr']:.1f} ATR | "
+            + "; ".join((x.get("cv_notes") or [])[:3]))
+
+    for x in AREA_REG:
+        x["hidden"] = not x.get("shown")
+    AREA_REG.sort(key=lambda q: (not q.get("shown"), -q["q"]))
+    del AREA_REG[80:]
+    try:
+        registry_diag(ctx, now)
+        commit_diag(now)
+        if now - AREA_DIAG.get("t_why", 0.0) >= 30 and AREA_DIAG.get("why_not"):
+            AREA_DIAG["t_why"] = now
+            log("[AREA-DIAG] kandidat belum ditandai karena: "
+                + ", ".join(f"{k} x{v}" for k, v in sorted(why_not.items(), key=lambda kv: -kv[1])))
+    except Exception:
+        log_exc("registry_diag")
+
+
+_registry_views_v30prev = registry_views
+
+
+def registry_views(ctx, now):
+    """Tampilan area: tambah keyakinan, tier, status komit, dan teks rencana yang jujur."""
+    out = _registry_views_v30prev(ctx, now)
+    by = {x["aid"]: x for x in AREA_REG}
+    for v in out:
+        x = by.get(v.get("id"))
+        if x is None:
+            continue
+        cv, tier = float(x.get("cv", 0.0)), x.get("tier", "-")
+        blk = list(x.get("blockers") or [])
+        armed = (not blk) and cv >= COMMIT_MIN_CV
+        if armed and v.get("limit") is not None:
+            txt = (f"KEYAKINAN {tier} ({cv:.0f}): {v['side']} LIMIT {v['limit']:.2f}, SL {v['sl']:.2f} "
+                   f"({v['sl_pips']} pips). Dikomit saat harga dalam {COMMIT_WINDOW_ATR:.0f} ATR, limit dipasang "
+                   f"dalam {LIMIT_PLACE_ATR:.0f} ATR (sekarang {x['dist_atr']:.1f} ATR)"
+                   + (" | SUDAH DIKOMIT" if x.get("commit") else ""))
+        elif armed:
+            txt = f"KEYAKINAN {tier} ({cv:.0f}): menunggu level limit"
+        else:
+            why = "; ".join(blk[:2]) if blk else f"keyakinan {cv:.0f} < {COMMIT_MIN_CV:.0f} (belum cukup yakin)"
+            txt = f"Dipantau (tier {tier}, {cv:.0f}): {why}"
+        v.update(cv=round(cv, 1), tier=tier, commit=bool(x.get("commit")), armed=bool(armed),
+                 plan=txt, aksi=txt, gates=([] if armed else blk),
+                 cv_parts={k: round(p, 1) for k, p in (x.get("cv_parts") or {}).items()},
+                 cv_notes=list(x.get("cv_notes") or [])[:4])
+    return out
+
+
+_plan_view_v30prev = plan_view
+
+
+def plan_view(c, a, px, T, is_focus):
+    v = _plan_view_v30prev(c, a, px, T, is_focus)
+    if c.get("cv") is not None:
+        v.update(cv=round(float(c["cv"]), 1), tier=c.get("tier"), commit=bool(c.get("commit")))
+    return v
+
+
+# ---------------------------------------------------------------- 5) pemilihan fokus: berbasis keyakinan
+def commit_pick(now, tick, exclude_aid=None, min_cv=None):
+    """Area tertandai terbaik yang boleh DIKOMIT. Syarat: keyakinan >= COMMIT_MIN_CV stabil COMMIT_DWELL_SEC,
+    tidak diblokir struktural, melawan tren M15 hanya jika tier A, ruang ke area lawan cukup (kecuali tier A),
+    dan harga dalam jendela COMMIT_WINDOW_ATR. Momentum pendekatan tidak dihitung sebagai alasan menolak."""
+    ctx = LAST_CTX
+    if not SNIPER_ON or not ctx or tick is None:
+        return None
+    a = float(ctx["a"])
+    srv = srv_now()
+    thr = COMMIT_MIN_CV if min_cv is None else max(COMMIT_MIN_CV, float(min_cv))
+    best, bs = None, -1e9
+    for x in AREA_REG:
+        s = x.get("setup")
+        if (not x.get("shown")) or s is None or x["aid"] == exclude_aid:
+            continue
+        if now - x["last_seen"] > SNIPER_STALE_SEC:
+            continue
+        cv = float(x.get("cv", 0.0))
+        if cv < thr or x["ss"] < COMMIT_MIN_ST:
+            continue
+        since = float(x.get("cv_ok_since") or 0.0)
+        if (not since) or now - since < COMMIT_DWELL_SEC:
+            continue
+        if _area_blockers(x, s, a, now, srv):
+            continue
+        tier = x.get("tier", "C")
+        if s.get("counter_trend") and tier != "A":
+            continue
+        lo, hi, sd = x["zone_lo"], x["zone_hi"], x["side"]
+        if is_parked(sd, lo, hi, now, 0.3 * a):
+            continue
+        buy = sd == "BUY"
+        px = float(tick.ask if buy else tick.bid)
+        dist = (px - hi) if buy else (lo - px)
+        if dist > COMMIT_WINDOW_ATR * a or dist < -SNIPER_INSIDE_FRAC * (hi - lo):
+            continue
+        if tier != "A":
+            br = opp_barrier(sd, lo, hi, a, px)
+            if br:
+                _room_log(x["aid"], br)
+                continue
+        sc = cv - COMMIT_DIST_W * max(0.0, dist) / a
+        if sc > bs:
+            best, bs = x, sc
+    return best
+
+
+def _sniper_candidate(now, tick):
+    return commit_pick(now, tick)
+
+
+def _sniper_setup(x, a, tick):
+    s = dict(x["setup"])
+    buy = x["side"] == "BUY"
+    px = float(tick.ask if buy else tick.bid)
+    dist = (px - x["zone_hi"]) if buy else (x["zone_lo"] - px)
+    p_now = max(float(x["ps"]), COMMIT_P_FLOOR)
+    s.update(zone_lo=x["zone_lo"], zone_hi=x["zone_hi"], p=round(p_now, 1), pw=round(p_now / 100.0, 4),
+             strength=round(x["ss"], 1), eligible=True, gates=[], room_ok=True,
+             dist_atr=round(max(0.0, dist) / a, 1), sniper=True, aid=x["aid"],
+             cv=round(float(x.get("cv", 0.0)), 1), tier=x.get("tier", "-"))
+    return s
+
+
+def pick_focus(elig, a, thr_pct):
+    """v30: fokus HANYA dari area berkeyakinan tinggi. Tidak ada lagi fokus dari kandidat sesaat."""
+    now = time.time()
+    if now - START_T < STARTUP_WARM_SEC:
+        return None
+    tk = mt5.symbol_info_tick(SYMBOL)
+    x = commit_pick(now, tk)
+    return _sniper_setup(x, a, tk) if x is not None else None
+
+
+def lock_focus(best, bar_t, now, st5, st15):
+    """Kunci fokus dan tandai areanya sebagai TERKOMIT."""
+    global PLAN_SEQ
+    PLAN_SEQ += 1
+    P = dict(best)
+    P.update(id=f"P{PLAN_SEQ}", since=now, bar0=bar_t, st5n0=st5["note"], st15n0=st15["note"],
+             exec=False, status="FOKUS", hold_min=0, ext=None, touched=False,
+             bad_bars=0, out_n=0, brk_t=0.0)
+    x = _area_by_id(best.get("aid")) if best.get("aid") else None
+    if x is not None:
+        x["commit"], x["commit_t"] = True, now
+        x["commit_cv"] = float(x.get("cv", COMMIT_MIN_CV))
+        P.update(commit=True, aid=x["aid"], cv=round(float(x["cv"]), 1), tier=x.get("tier", "-"))
+        log(f"[KOMITMEN] {x['side']} {x['name']} [{x['tf']}] {x['zone_lo']}-{x['zone_hi']} "
+            f"keyakinan {x['cv']:.0f} tier {x.get('tier')}: " + "; ".join((x.get("cv_notes") or [])[:3]))
+    P["aksi"] = aksi_text(P["side"], "FOKUS", P["zone_lo"], P["zone_hi"], P["entry"])
+    return P
+
+
+def sniper_step(tick):
+    """Tiap siklus bot: jika tidak ada fokus, komit area berkeyakinan terbaik."""
+    global PLAN_ACTIVE
+    if not SNIPER_ON or not LAST_CTX:
+        return
+    now = time.time()
+    if PLAN_ACTIVE is not None or PENDING["order"] or cache["open"]:
+        return
+    if now < LOCK_PAUSE["until"] or now - START_T < STARTUP_WARM_SEC:
+        return
+    x = commit_pick(now, tick)
+    if x is None:
+        return
+    a = float(LAST_CTX["a"])
+    F = lock_focus(_sniper_setup(x, a, tick), int(LAST_CTX["T"][-1]), now, LAST_CTX["st5"], LAST_CTX["st15"])
+    PLAN_ACTIVE = F
+    LOCK_IDLE["since"] = 0.0
+    _plan_log(now, F["id"],
+              f"[KOMITMEN] FOKUS {F['side']} {F['name']} [{F['tf']}] {F['zone_lo']}-{F['zone_hi']} "
+              f"keyakinan {F.get('cv', 0):.0f} tier {F.get('tier')} kuat {F['strength']:.0f} "
+              f"jarak {F['dist_atr']} ATR. Limit dipasang di level presisi, tidak diganti kecuali area tembus")
+
+
+_try_switch_focus_v30prev = try_switch_focus
+
+
+def try_switch_focus(ranked_all, elig_live, a, now, bar_t, st5, st15):
+    """Fokus terkomit hanya diganti jika: belum disentuh, harga masih jauh, sudah lama dipegang, dan kandidat
+    JAUH lebih yakin (atau lebih dekat ke harga dan lebih yakin)."""
+    global PLAN_ACTIVE
+    P = PLAN_ACTIVE
+    if P is None or not P.get("commit"):
+        return _try_switch_focus_v30prev(ranked_all, elig_live, a, now, bar_t, st5, st15)
+    if (not SWITCH_ON or P.get("exec") or P.get("touched") or cache["open"] or PENDING.get("touched")):
+        return False
+    if now - P.get("since", now) < COMMIT_SWITCH_HOLD_SEC or now - SWITCH_STATE["t"] < COMMIT_SWITCH_COOLDOWN_SEC:
+        return False
+    tk = mt5.symbol_info_tick(SYMBOL)
+    if tk is None:
+        return False
+    buy = P["side"] == "BUY"
+    px = float(tk.ask if buy else tk.bid)
+    d_cur = ((px - float(P["zone_hi"])) if buy else (float(P["zone_lo"]) - px)) / a
+    if d_cur <= COMMIT_NEAR_ATR:
+        return False
+    xc = _area_by_id(P.get("aid"))
+    cur_cv = float(xc["cv"]) if xc is not None else float(P.get("cv", 0.0))
+    cand = commit_pick(now, tk, exclude_aid=P.get("aid"), min_cv=cur_cv + COMMIT_SWITCH_MARGIN)
+    if cand is None:
+        return False
+    cb = cand["side"] == "BUY"
+    d_new = ((px - cand["zone_hi"]) if cb else (cand["zone_lo"] - px)) / a
+    if float(cand["cv"]) < cur_cv + COMMIT_SWITCH_FAR_MARGIN and d_new >= d_cur:
+        return False
+    if PENDING["order"] and not cancel_pending("diganti area yang jauh lebih meyakinkan", force=True, block=False):
+        return False
+    SWITCH_STATE["t"] = now
+    _plan_log(now, P["id"],
+              f"GANTI KOMITMEN {P['side']} {P['name']} ({P['zone_lo']}-{P['zone_hi']}, cv {cur_cv:.0f}) -> "
+              f"{cand['side']} {cand['name']} ({cand['zone_lo']}-{cand['zone_hi']}, cv {cand['cv']:.0f})")
+    commit_release(P.get("aid"))
+    PLAN_ACTIVE = lock_focus(_sniper_setup(cand, a, tk), bar_t, now, st5, st15)
+    LOCK_IDLE["since"] = 0.0
+    return True
+
+
+# ---------------------------------------------------------------- 6) fokus terkomit hanya gugur oleh bukti nyata
+_important_break_reason_v30prev = important_break_reason
+
+
+def important_break_reason(P, anchor, C, a):
+    if P.get("commit"):
+        return None                  # area lain ditembus menuju fokus = hanya pendekatan, bukan alasan melepas
+    return _important_break_reason_v30prev(P, anchor, C, a)
+
+
+_focus_guard_bar_v30prev = focus_guard_bar
+
+
+def focus_guard_bar(P, C, a, strong, st5, st15, hi, lo):
+    """Dipanggil tiap candle M1 tutup. Fokus terkomit TIDAK gugur karena CHoCH M5/M1, konsensus, bias, atau
+    area penting lain tembus. Hanya: tembus close berturut-turut, area dicabut registry, harga lari setelah
+    disentuh, harga sangat jauh, atau komitmen kedaluwarsa."""
+    if not P.get("commit"):
+        return _focus_guard_bar_v30prev(P, C, a, strong, st5, st15, hi, lo)
+    buy = P["side"] == "BUY"
+    now = time.time()
+    cl = float(C[-1])
+    zlo, zhi = float(P["zone_lo"]), float(P["zone_hi"])
+    if hi >= zlo and lo <= zhi:
+        P["touched"] = True
+    beyond = (zlo - cl) if buy else (cl - zhi)
+    msg_brk = ("area support tembus ke bawah" if buy else "area resistance tembus ke atas")
+    if beyond >= COMMIT_BREAK_DEEP_ATR * a:
+        return f"{msg_brk} (satu close M1 menembus dalam)"
+    if beyond >= COMMIT_BREAK_ATR * a:
+        P["out_n"] = int(P.get("out_n", 0)) + 1
+        if P["out_n"] >= COMMIT_BREAK_CLOSES:
+            return f"{msg_brk} ({P['out_n']} close M1 berturut-turut di luar)"
+    else:
+        P["out_n"] = 0
+    if _area_by_id(P.get("aid")) is None:
+        return "area dicabut dari registry (tembus close TF area atau sudah terpakai)"
+    away = ((cl - zhi) if buy else (zlo - cl)) / a
+    if P.get("touched") and away > COMMIT_AWAY_ATR:
+        return "harga lari meninggalkan area setelah disentuh"
+    if away > COMMIT_FAR_RELEASE_ATR:
+        return f"harga lari terlalu jauh dari area (> {COMMIT_FAR_RELEASE_ATR:.0f} ATR), komitmen dilepas"
+    if (not P.get("touched")) and now - P.get("since", now) > COMMIT_MAX_MIN * 60:
+        return f"harga lari: area belum tersentuh dalam {COMMIT_MAX_MIN} menit, komitmen dilepas"
+    return None
+
+
+_live_guard_v30prev = live_guard
+
+
+def live_guard(tick):
+    """Penjagaan live. Fokus terkomit: wick sesaat ditoleransi, tembus live baru dihitung jika dalam dan bertahan."""
+    P = PLAN_ACTIVE
+    if P is None or not P.get("commit"):
+        return _live_guard_v30prev(tick)
+    a = float(P["atr"])
+    buy = P["side"] == "BUY"
+    bid, ask = float(tick.bid), float(tick.ask)
+    if (buy and bid <= P["zone_hi"]) or ((not buy) and ask >= P["zone_lo"]):
+        P["touched"] = True
+    if P.get("exec") or cache["open"] or (PENDING["order"] and PENDING.get("touched")):
+        return
+    now = time.time()
+    if (buy and bid <= P["sl"]) or ((not buy) and ask >= P["sl"]):
+        drop_focus(P, "SL tersentuh sebelum order", now)
+        return
+    beyond = (P["zone_lo"] - bid) if buy else (ask - P["zone_hi"])
+    if beyond >= COMMIT_LIVE_BREAK_ATR * a:
+        if not P.get("brk_t"):
+            P["brk_t"] = now
+        elif now - P["brk_t"] >= COMMIT_LIVE_BREAK_SEC:
+            drop_focus(P, ("area support tembus ke bawah" if buy else "area resistance tembus ke atas")
+                       + f" (live, bertahan {COMMIT_LIVE_BREAK_SEC} detik)", now)
+    else:
+        P["brk_t"] = 0.0
+
+
+_match_focus_v30prev = match_focus
+
+
+def match_focus(P, setups, a):
+    """Fokus terkomit selalu 'valid': semua gerbang lunak/momentum dibuang, hanya COMMIT_HARD_GATES yang dibawa.
+    Jika detektor sesaat tidak melihat area, datanya diambil dari registry. P dijaga >= COMMIT_P_FLOOR."""
+    m = _match_focus_v30prev(P, setups, a)
+    if P is None or not P.get("commit"):
+        return m
+    x = _area_by_id(P.get("aid"))
+    if m is not None:
+        base = dict(m)
+    elif x is not None and x.get("setup") is not None:
+        base = dict(x["setup"])
+    else:
+        base = dict(P)
+    hard = [g for g in (base.get("gates") or []) if g.startswith(COMMIT_HARD_GATES)]
+    p_now = max(float(base.get("p", 0.0)), COMMIT_P_FLOOR)
+    base.update(gates=hard, eligible=not hard, room_ok=True, p=round(p_now, 1), pw=round(p_now / 100.0, 4))
+    if x is not None:
+        base["strength"] = max(float(base.get("strength", 0.0)), round(float(x.get("ss", 0.0)), 1))
+        P["cv"], P["tier"] = round(float(x.get("cv", 0.0)), 1), x.get("tier", "-")
+    return base
+
+
+# ---------------------------------------------------------------- 7) limit terkomit tidak dibatalkan sembarangan
+_pending_validity_check_v30prev = pending_validity_check
+
+
+def pending_validity_check(tick):
+    P = PLAN_ACTIVE
+    if P is not None and P.get("commit") and P.get("id") == PENDING.get("plan"):
+        return False                 # limit terkomit tidak dibatalkan karena pola/P sesaat
+    return _pending_validity_check_v30prev(tick)
+
+
+_manage_pending_v30prev = manage_pending
+
+
+def manage_pending(tick):
+    """Selama komitmen aktif dan limit belum tersentuh, kedaluwarsa limit terus diperpanjang."""
+    try:
+        P = PLAN_ACTIVE
+        if (PENDING["order"] and P is not None and P.get("commit") and P.get("id") == PENDING.get("plan")
+                and not PENDING.get("touched")
+                and time.time() - float(P.get("since", time.time())) < COMMIT_MAX_MIN * 60):
+            PENDING["exp"] = srv_now() + PENDING_EXPIRE_MIN * 60
+    except Exception:
+        log_exc("commit_pending_refresh")
+    _manage_pending_v30prev(tick)
+
+
+def _arm_entry_v19b(tick):
+    """Pengganti lapisan veto pembalikan v22 untuk fokus terkomit (limit tetap dipasang)."""
+    P = PLAN_ACTIVE
+    if P is not None and P.get("commit"):
+        return _arm_entry_orig(tick)
+    return _arm_entry_v22_core(tick)
+
+
+_place_limit_v30prev = place_limit
+
+
+def place_limit(P, tick, info):
+    """Fokus terkomit: lewati penghalang v28 (sudah dinilai saat komit)."""
+    if P.get("commit"):
+        return _place_limit_v28prev(P, tick, info)
+    return _place_limit_v30prev(P, tick, info)
+
+    
 if __name__ == "__main__":
     ok = mt5.initialize(login=LOGIN, password=PASSWORD, server=SERVER) if LOGIN else mt5.initialize()
     if not ok:
